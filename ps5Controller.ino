@@ -5,15 +5,16 @@
   - Esteira esquerda: 2 relés (DIR A / DIR B)
   - Esteira direita: 2 relés (DIR A / DIR B)
   - Torre: 2 relés (DIR A / DIR B)
-  - Farol: 1 relé (toggle no R2)
-  - “Quadrado”: 1 relé pulsado por 1s (só após liberar sequência X -> Bola -> Triângulo -> Quadrado)
+  - Farol: 1 relé (toggle no L2)
+  - R2: 1 relé pulsado por 1s (SÓ após liberar sequência X -> Bola -> Triângulo -> Quadrado)
 
   Segurança:
   - Se perder conexão do controle: DESLIGA TUDO imediatamente.
+  - Se continuar sem conexão por 15s: RESETA o ESP32.
 */
 
 // ======================= PINOS (AJUSTE AQUI) =======================
-#define LED_PIN 2
+#define LED_PIN 27
 
 // Esteira ESQUERDA (ponte H via relés)
 #define REL_LEFT_IN1  4
@@ -30,12 +31,14 @@
 // FAROL
 #define REL_FARO  23
 
-// RELÉ “QUADRADO” (pulso 1s)
+// RELÉ DE PULSO (R2 após liberar)
 #define REL_PULSE  25
 
 // ======================= CONFIG =======================
-const uint32_t UNLOCK_STEP_TIMEOUT_MS = 5000;  // tempo máximo entre etapas X -> O -> △ -> □
-const uint32_t PULSE_MS = 1000;                // pulso do relé do quadrado
+const uint32_t UNLOCK_STEP_TIMEOUT_MS = 5000;   // tempo máximo entre etapas X -> O -> △ -> □
+const uint32_t PULSE_MS = 1000;                 // pulso do relé
+const uint32_t LED_BLINK_MS = 250;              // pisca do LED enquanto desconectado
+const uint32_t DISCONNECT_RESET_MS = 15000;     // reset após 15s sem controle
 
 // Se seus relés forem “ativo em LOW”, mude para LOW/HIGH abaixo.
 const uint8_t REL_ON  = HIGH;
@@ -45,7 +48,9 @@ const uint8_t REL_OFF = LOW;
 bool farolOn = false;
 
 // bordas (edge detect)
+bool prevL2 = false;
 bool prevR2 = false;
+
 bool prevX = false;
 bool prevCircle = false;
 bool prevTriangle = false;
@@ -56,9 +61,14 @@ enum UnlockStep { WAIT_X, WAIT_CIRCLE, WAIT_TRIANGLE, WAIT_SQUARE, UNLOCKED };
 UnlockStep unlockStep = WAIT_X;
 uint32_t unlockLastStepMs = 0;
 
-// Pulso do relé do quadrado (sem delay bloqueante)
+// Pulso do relé (sem delay bloqueante)
 bool pulseActive = false;
 uint32_t pulseStartMs = 0;
+
+// Controle de desconexão
+uint32_t disconnectStartMs = 0;
+uint32_t lastLedBlinkMs = 0;
+bool ledState = false;
 
 // ======================= HELPERS =======================
 void relayWrite(uint8_t pin, bool on) {
@@ -99,7 +109,8 @@ void stopAllRelays() {
   unlockLastStepMs = 0;
 
   // reset edges
-  prevR2 = prevX = prevCircle = prevTriangle = prevSquare = false;
+  prevL2 = prevR2 = false;
+  prevX = prevCircle = prevTriangle = prevSquare = false;
 }
 
 bool risingEdge(bool now, bool &prev) {
@@ -119,7 +130,6 @@ void resetUnlockIfTimeout() {
 void handleUnlockSequence(bool xNow, bool circleNow, bool triNow, bool squareNow) {
   resetUnlockIfTimeout();
 
-  // bordas
   bool xRise = risingEdge(xNow, prevX);
   bool cRise = risingEdge(circleNow, prevCircle);
   bool tRise = risingEdge(triNow, prevTriangle);
@@ -148,46 +158,71 @@ void handleUnlockSequence(bool xNow, bool circleNow, bool triNow, bool squareNow
       break;
 
     case WAIT_SQUARE:
-      // Importante: “quadrado” nessa etapa só LIBERA.
+      // Quadrado nessa etapa só LIBERA o R2
       if (sRise) {
         unlockStep = UNLOCKED;
         unlockLastStepMs = millis();
-        Serial.println("Sequencia liberada! Quadrado agora dispara rele por 1s.");
+        Serial.println("Sequencia liberada! Agora R2 pulsa o rele por 1s.");
       }
       break;
 
     case UNLOCKED:
-      // nada aqui; o disparo do quadrado é tratado separadamente
+      // nada
       break;
   }
 }
 
-void handlePulseRelay(bool squareNow) {
-  // Em UNLOCKED: quadrado dá pulso 1s
-  if (unlockStep == UNLOCKED) {
-    bool sRise = risingEdge(squareNow, prevSquare);
+void handlePulseRelayByR2(bool r2Now) {
+  // Só pode pulsar se estiver UNLOCKED
+  if (unlockStep != UNLOCKED) return;
 
-    if (sRise && !pulseActive) {
-      pulseActive = true;
-      pulseStartMs = millis();
-      relayWrite(REL_PULSE, true);
-      Serial.println("Quadrado: pulso rele (1s)");
-    }
+  bool r2Rise = risingEdge(r2Now, prevR2);
+
+  if (r2Rise && !pulseActive) {
+    pulseActive = true;
+    pulseStartMs = millis();
+    relayWrite(REL_PULSE, true);
+    Serial.println("R2: pulso rele (1s)");
   }
 
-  // encerra pulso
   if (pulseActive && (millis() - pulseStartMs >= PULSE_MS)) {
     pulseActive = false;
     relayWrite(REL_PULSE, false);
   }
 }
 
-void handleFarolToggle(bool r2Now) {
-  // Toggle no clique (borda de subida)
-  if (risingEdge(r2Now, prevR2)) {
+void handleFarolToggleByL2(bool l2Now) {
+  if (risingEdge(l2Now, prevL2)) {
     farolOn = !farolOn;
     relayWrite(REL_FARO, farolOn);
     Serial.println(farolOn ? "Farol: LIGADO" : "Farol: DESLIGADO");
+  }
+}
+
+void handleDisconnectedState() {
+  // segurança imediata
+  stopAllRelays();
+
+  // marca início da desconexão
+  if (disconnectStartMs == 0) {
+    disconnectStartMs = millis();
+    lastLedBlinkMs = millis();
+    ledState = false;
+    digitalWrite(LED_PIN, ledState);
+    Serial.println("Controle desconectado! Desligando tudo e aguardando reconexao...");
+  }
+
+  // pisca LED (não-bloqueante)
+  if (millis() - lastLedBlinkMs >= LED_BLINK_MS) {
+    lastLedBlinkMs = millis();
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState);
+  }
+
+  // reset após 15s sem controle
+  if (millis() - disconnectStartMs >= DISCONNECT_RESET_MS) {
+    Serial.println("Sem controle por 15s. Reiniciando ESP32...");
+    ESP.restart();
   }
 }
 
@@ -219,15 +254,15 @@ void setup() {
 
 void loop() {
   if (!ps5.isConnected()) {
-    // Segurança: desliga tudo se perder conexão
-    stopAllRelays();
-
-    // Pisca LED enquanto não conectado
-    digitalWrite(LED_PIN, HIGH);
-    delay(250);
-    digitalWrite(LED_PIN, LOW);
-    delay(250);
+    handleDisconnectedState();
     return;
+  }
+
+  // voltou a conectar
+  if (disconnectStartMs != 0) {
+    Serial.println("Controle reconectado!");
+    disconnectStartMs = 0;
+    ledState = true;
   }
 
   // Conectado: LED aceso
@@ -242,24 +277,22 @@ void loop() {
   bool L1 = ps5.L1();
   bool R1 = ps5.R1();
 
-  bool R2 = ps5.R2();          // toggle farol
+  bool L2 = ps5.L2();          // toggle farol
+  bool R2 = ps5.R2();          // pulso 1s (após unlock)
+
   bool X  = ps5.Cross();       // X
   bool O  = ps5.Circle();      // Bola
   bool T  = ps5.Triangle();    // Triângulo
-  bool SQ = ps5.Square();      // Quadrado (libera + depois dispara pulso)
+  bool SQ = ps5.Square();      // Quadrado (libera)
 
-  // ======================= FAROL (R2 toggle) =======================
-  handleFarolToggle(R2);
+  // ======================= FAROL (L2 toggle) =======================
+  handleFarolToggleByL2(L2);
 
   // ======================= SEQUÊNCIA DE LIBERAÇÃO =======================
   handleUnlockSequence(X, O, T, SQ);
 
-  // ======================= DISPARO DO RELÉ DO QUADRADO (1s) =======================
-  // OBS: handleUnlockSequence já usa prevSquare internamente nas etapas iniciais.
-  // Para não conflitar, aqui só chama se estiver UNLOCKED.
-  if (unlockStep == UNLOCKED) {
-    handlePulseRelay(SQ);
-  }
+  // ======================= PULSO (R2 após liberar) =======================
+  handlePulseRelayByR2(R2);
 
   // ======================= CONTROLE DAS ESTEIRAS =======================
   // Prioridade: CIMA/BAIXO (duas esteiras) > ESQ/DIR (uma esteira)
@@ -296,7 +329,4 @@ void loop() {
   else turretDir = 0;
 
   setMotor(REL_TURRET_IN1, REL_TURRET_IN2, turretDir);
-
-  // ======================= GARANTIA: se algum pulso ativo, mantém (já tratado acima) =======================
-  // Nada adicional aqui.
 }
